@@ -63,14 +63,19 @@ class ApigeeToOpenAPI:
         apiproxy = base / "apiproxy"
         if not apiproxy.exists():
             raise FileNotFoundError("apiproxy folder not found inside bundle")
-
+    
+        # Auto-detect proxy XML file if name not provided or mismatched
+        xml_files = list(apiproxy.glob("*.xml"))
+        if not xml_files:
+            raise FileNotFoundError("No API proxy XML found in apiproxy/")
+        api_xml = xml_files[0]
         if not api_name:
-            api_name = apiproxy.stem
-
-        api_xml = apiproxy / f"{api_name}.xml"
+            api_name = api_xml.stem
+    
         root = self._load_xml(api_xml)
         if root is None:
             raise FileNotFoundError(f"Cannot parse {api_xml}")
+
 
         # Init base spec
         parsed_url = urlparse(endpoint_url)
