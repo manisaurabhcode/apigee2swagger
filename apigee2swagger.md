@@ -1,4 +1,12 @@
-#Usage example
+##Interactive Mode
+Convert directly from a ZIP or folder:
+python apigee_to_openapi.py ./ApigeeBundle.zip --preview
+
+WebUI
+python apigee_to_openapi.py --ui
+
+
+##Usage example
 if __name__ == "__main__":
     proxy_location = "/path/to/apigee/proxy"
     api_name = "jira-release-notes"
