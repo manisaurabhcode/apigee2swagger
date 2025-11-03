@@ -39,7 +39,14 @@ class ApigeeToOpenAPI:
         openapi = {
             "openapi": "3.0.3",
             "info": {"title": "Converted Apigee Proxy", "version": "1.0.0"},
-            "paths": {"/example": {"get": {"summary": "Sample endpoint", "responses": {"200": {"description": "OK"}}}}},
+            "paths": {
+                "/example": {
+                    "get": {
+                        "summary": "Sample endpoint",
+                        "responses": {"200": {"description": "OK"}}
+                    }
+                }
+            },
         }
         return openapi
 
@@ -124,17 +131,16 @@ def launch_ui():
             <input type="file" name="file" accept=".zip" required><br><br>
             <button type="submit">Convert</button>
         </form>
-        {% endraw %}
-        {% if swagger_url %}
-            <p>✅ Conversion complete!</p>
-            <a href="{{ swagger_url }}" target="_blank">Open Swagger UI Preview</a>
-        {% endif %}
+    {% endraw %}
+    {% if swagger_url %}
+        <p>✅ Conversion complete!</p>
+        <a href="{{ swagger_url }}" target="_blank">Open Swagger UI Preview</a>
+    {% endif %}
     {% raw %}
     </body>
     </html>
     {% endraw %}
     """
-
 
     @app.route("/", methods=["GET"])
     def index():
