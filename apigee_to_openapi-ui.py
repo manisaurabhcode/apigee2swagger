@@ -1,221 +1,268 @@
+#!/usr/bin/env python3
+"""
+Apigee Proxy → OpenAPI 3.0 Converter
+------------------------------------
+• Works from ZIP or extracted folder
+• Generates openapi.yaml + openapi.json
+• Optional Swagger UI preview (--preview)
+• Optional simple upload UI (--ui)
+"""
+
 import os
-import sys
-import zipfile
+import re
 import json
 import yaml
+import zipfile
 import tempfile
 import webbrowser
+import xml.etree.ElementTree as ET
 from pathlib import Path
+from urllib.parse import urlparse
+from typing import Dict, Any, Optional, List, Set
 from flask import Flask, request, render_template_string, send_file
 
-# ==============================
-#  Apigee → OpenAPI Converter
-# ==============================
+
+# =====================================================
+#   Core Converter
+# =====================================================
 class ApigeeToOpenAPI:
-    def __init__(self, input_path: str):
-        self.input_path = Path(input_path)
+    def __init__(self, proxy_source: str):
+        self.src_path = Path(proxy_source)
         self.temp_dir = None
+        self.openapi: Dict[str, Any] = {}
 
-    def extract_zip(self):
-        if zipfile.is_zipfile(self.input_path):
+    # ---------- Helpers ----------
+    def _load_xml(self, path: Path) -> Optional[ET.Element]:
+        try:
+            return ET.parse(path).getroot()
+        except Exception:
+            return None
+
+    def _text(self, e: Optional[ET.Element], default=""):
+        return e.text.strip() if e is not None and e.text else default
+
+    def _attr(self, e: Optional[ET.Element], key, default=""):
+        return e.get(key, default) if e is not None else default
+
+    # ---------- I/O ----------
+    def extract_zip(self) -> Path:
+        """If input is ZIP, extract it."""
+        if zipfile.is_zipfile(self.src_path):
             self.temp_dir = Path(tempfile.mkdtemp())
-            with zipfile.ZipFile(self.input_path, 'r') as zip_ref:
-                zip_ref.extractall(self.temp_dir)
-            print(f"📦 Extracted ZIP to {self.temp_dir}")
+            with zipfile.ZipFile(self.src_path, "r") as z:
+                z.extractall(self.temp_dir)
+            print(f"📦 Extracted to {self.temp_dir}")
             return self.temp_dir
-        elif self.input_path.is_dir():
-            return self.input_path
-        else:
-            raise ValueError("Input must be a zip file or a directory")
+        elif self.src_path.is_dir():
+            return self.src_path
+        raise ValueError("Input must be a zip or directory")
 
-    def find_proxy_files(self, base_path):
-        files = list(base_path.rglob("*.xml"))
-        if not files:
-            raise FileNotFoundError("No XML files found in Apigee bundle")
-        return files
+    # ---------- Main ----------
+    def generate(self, api_name: Optional[str] = None, endpoint_url: str = "") -> Dict[str, Any]:
+        base = self.extract_zip()
+        apiproxy = base / "apiproxy"
+        if not apiproxy.exists():
+            raise FileNotFoundError("apiproxy folder not found inside bundle")
 
-    def convert_to_openapi(self):
-        # Placeholder: minimal structure — extend per Apigee XML content
-        openapi = {
+        if not api_name:
+            api_name = apiproxy.stem
+
+        api_xml = apiproxy / f"{api_name}.xml"
+        root = self._load_xml(api_xml)
+        if root is None:
+            raise FileNotFoundError(f"Cannot parse {api_xml}")
+
+        # Init base spec
+        parsed_url = urlparse(endpoint_url)
+        self.openapi = {
             "openapi": "3.0.3",
-            "info": {"title": "Converted Apigee Proxy", "version": "1.0.0"},
-            "paths": {
-                "/example": {
-                    "get": {
-                        "summary": "Sample endpoint",
-                        "responses": {"200": {"description": "OK"}}
-                    }
-                }
+            "info": {
+                "title": self._text(root.find("DisplayName"), api_name),
+                "description": self._text(root.find("Description")),
+                "version": f"{root.get('revision','1')}.0.0",
             },
+            "servers": [{"url": f"{parsed_url.scheme}://{parsed_url.netloc}"}] if endpoint_url else [],
+            "paths": {},
+            "components": {"securitySchemes": {}},
+            "tags": [],
         }
-        return openapi
 
-    def save_to_file(self, openapi_data, output_name="openapi"):
-        json_path = Path(f"{output_name}.json")
-        yaml_path = Path(f"{output_name}.yaml")
+        # ---- proxy endpoints
+        proxies = (apiproxy / "proxies").glob("*.xml")
+        for pxml in proxies:
+            p_root = self._load_xml(pxml)
+            if not p_root:
+                continue
+            self._parse_proxy_endpoint(p_root)
 
-        with open(json_path, "w") as jf:
-            json.dump(openapi_data, jf, indent=2)
-        with open(yaml_path, "w") as yf:
-            yaml.dump(openapi_data, yf, sort_keys=False)
+        # ---- targets
+        targets = (apiproxy / "targets").glob("*.xml")
+        backends = []
+        for txml in targets:
+            t_root = self._load_xml(txml)
+            if not t_root:
+                continue
+            u = t_root.find(".//HTTPTargetConnection/URL")
+            if u is not None:
+                backends.append({"name": txml.stem, "url": self._text(u)})
+        if backends:
+            self.openapi["info"]["x-backend-services"] = backends
 
-        print(f"✅ Saved:\n - {json_path}\n - {yaml_path}")
-        return json_path, yaml_path
+        return self.openapi
+
+    # ---------- proxy parsing ----------
+    def _parse_proxy_endpoint(self, root: ET.Element):
+        base_path = self._text(root.find(".//HTTPProxyConnection/BasePath"))
+        flows = root.findall(".//Flows/Flow")
+        for flow in flows:
+            cond = self._text(flow.find("Condition"))
+            verb, path = self._extract_path_verb(cond)
+            if not path:
+                continue
+            if not path.startswith("/"):
+                path = f"{base_path or ''}/{path}".replace("//", "/")
+
+            op = {
+                "operationId": flow.get("name", ""),
+                "responses": {"200": {"description": "OK"}},
+            }
+            tag = path.strip("/").split("/")[0] or "default"
+            op["tags"] = [tag]
+            if tag not in [t["name"] for t in self.openapi["tags"]]:
+                self.openapi["tags"].append({"name": tag})
+            if path not in self.openapi["paths"]:
+                self.openapi["paths"][path] = {}
+            self.openapi["paths"][path][verb or "get"] = op
+
+    def _extract_path_verb(self, condition: str):
+        v = re.search(r'request\.(verb|method)\s*[=!]+\s*"([^"]+)"', condition)
+        p = re.search(r'proxy\.pathsuffix\s+(MatchesPath|=|~)\s*"([^"]+)"', condition)
+        return (v.group(2).lower() if v else "get", p.group(2) if p else "")
+
+    # ---------- save ----------
+    def save(self, out_name="openapi") -> (Path, Path):
+        j = Path(f"{out_name}.json")
+        y = Path(f"{out_name}.yaml")
+        with open(j, "w", encoding="utf8") as jf:
+            json.dump(self.openapi, jf, indent=2)
+        with open(y, "w", encoding="utf8") as yf:
+            yaml.dump(self.openapi, yf, sort_keys=False)
+        print(f"✅ Saved {j} and {y}")
+        return j, y
 
 
-# ==============================
-# Swagger Preview (local)
-# ==============================
-def preview_swagger_ui(spec_path: str, port=5000):
+# =====================================================
+#   Swagger Preview
+# =====================================================
+def swagger_preview(spec_path: Path, port=5001):
     app = Flask(__name__)
-    spec_file = Path(spec_path)
-
-    @app.route("/openapi.yaml")
-    @app.route("/openapi.yml")
-    @app.route("/openapi.json")
-    def serve_spec():
-        return send_file(spec_file)
 
     @app.route("/")
-    def swagger_ui():
+    def ui():
         return f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <meta charset="utf-8" />
-            <title>Swagger UI - {spec_file.name}</title>
-            <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist/swagger-ui.css">
-        </head>
-        <body>
-            <div id="swagger-ui"></div>
-            <script src="https://unpkg.com/swagger-ui-dist/swagger-ui-bundle.js"></script>
-            <script>
-                const ui = SwaggerUIBundle({{
-                    url: '/openapi{spec_file.suffix}',
-                    dom_id: '#swagger-ui',
-                    presets: [SwaggerUIBundle.presets.apis],
-                    layout: "BaseLayout"
-                }});
-            </script>
-        </body>
-        </html>
-        """
+        <!DOCTYPE html><html><head>
+        <title>Swagger UI</title>
+        <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist/swagger-ui.css">
+        </head><body><div id="swagger"></div>
+        <script src="https://unpkg.com/swagger-ui-dist/swagger-ui-bundle.js"></script>
+        <script>
+        SwaggerUIBundle({{
+          url: '/spec',
+          dom_id: '#swagger'
+        }});
+        </script></body></html>"""
+
+    @app.route("/spec")
+    def spec():
+        return send_file(spec_path)
 
     webbrowser.open(f"http://127.0.0.1:{port}")
     app.run(port=port, debug=False)
 
 
-# ==============================
-# Web Upload UI
-# ==============================
+# =====================================================
+#   Simple Upload UI
+# =====================================================
 def launch_ui():
     app = Flask(__name__)
-    upload_dir = Path(tempfile.mkdtemp())
+    workdir = Path(tempfile.mkdtemp())
 
-    TEMPLATE = """
+    HTML = """
     {% raw %}
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <title>Apigee → OpenAPI Converter</title>
-        <style>
-            body { font-family: sans-serif; margin: 40px; }
-            h2 { color: #333; }
-            .box { border: 2px dashed #bbb; padding: 20px; border-radius: 12px; width: 400px; }
-        </style>
-    </head>
-    <body>
-        <h2>Apigee Proxy → OpenAPI Converter</h2>
-        <form action="/convert" method="post" enctype="multipart/form-data" class="box">
-            <input type="file" name="file" accept=".zip" required><br><br>
-            <button type="submit">Convert</button>
-        </form>
+    <!DOCTYPE html><html><head>
+      <meta charset="utf-8"><title>Apigee → OpenAPI</title>
+      <style>body{font-family:sans-serif;margin:40px;}
+      .box{border:2px dashed #aaa;padding:20px;border-radius:10px;width:420px;}
+      </style></head><body>
+      <h2>Apigee Proxy → OpenAPI 3.0</h2>
+      <form method="post" enctype="multipart/form-data" class="box">
+        <input type="file" name="file" accept=".zip" required><br><br>
+        <input type="text" name="endpoint" placeholder="Proxy endpoint URL (optional)" style="width:400px"><br><br>
+        <button type="submit">Convert</button>
+      </form>
     {% endraw %}
     {% if swagger_url %}
-        <p>✅ Conversion complete!</p>
-        <a href="{{ swagger_url }}" target="_blank">Open Swagger UI Preview</a>
+      <p>✅ Conversion done.</p>
+      <a href="{{ swagger_url }}" target="_blank">Open Swagger UI Preview</a>
     {% endif %}
-    {% raw %}
-    </body>
-    </html>
-    {% endraw %}
+    {% raw %}</body></html>{% endraw %}
     """
 
     @app.route("/", methods=["GET"])
     def index():
-        return render_template_string(TEMPLATE, swagger_url=None)
+        return render_template_string(HTML, swagger_url=None)
 
-    @app.route("/convert", methods=["POST"])
+    @app.route("/", methods=["POST"])
     def convert():
-        file = request.files["file"]
-        if not file or not file.filename.endswith(".zip"):
-            return "Invalid file. Please upload a .zip.", 400
+        f = request.files["file"]
+        endpoint = request.form.get("endpoint", "")
+        z = workdir / f.filename
+        f.save(z)
+        conv = ApigeeToOpenAPI(z)
+        data = conv.generate(endpoint_url=endpoint)
+        _, y = conv.save(workdir / "openapi")
+        return render_template_string(HTML, swagger_url=f"/swagger/{y.name}")
 
-        zip_path = upload_dir / file.filename
-        file.save(zip_path)
-        converter = ApigeeToOpenAPI(zip_path)
-        base_path = converter.extract_zip()
-        _ = converter.find_proxy_files(base_path)
-        openapi_data = converter.convert_to_openapi()
-        _, yaml_path = converter.save_to_file(openapi_data, output_name=upload_dir / "openapi")
-
-        swagger_url = f"/swagger/{yaml_path.name}"
-        return render_template_string(TEMPLATE, swagger_url=swagger_url)
-
-    @app.route("/swagger/<filename>")
-    def swagger(filename):
+    @app.route("/swagger/<fname>")
+    def swagger(fname):
         return f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <meta charset="utf-8" />
-            <title>Swagger UI - {filename}</title>
-            <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist/swagger-ui.css">
-        </head>
-        <body>
-            <div id="swagger-ui"></div>
-            <script src="https://unpkg.com/swagger-ui-dist/swagger-ui-bundle.js"></script>
-            <script>
-                const ui = SwaggerUIBundle({{
-                    url: '/files/{filename}',
-                    dom_id: '#swagger-ui'
-                }});
-            </script>
-        </body>
-        </html>
-        """
+        <!DOCTYPE html><html><head>
+        <meta charset="utf-8"><title>Swagger UI</title>
+        <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist/swagger-ui.css">
+        </head><body><div id="swagger"></div>
+        <script src="https://unpkg.com/swagger-ui-dist/swagger-ui-bundle.js"></script>
+        <script>SwaggerUIBundle({{url:'/files/{fname}',dom_id:'#swagger'}});</script>
+        </body></html>"""
 
-    @app.route("/files/<filename>")
-    def serve_file(filename):
-        return send_file(upload_dir / filename)
+    @app.route("/files/<fname>")
+    def files(fname):
+        return send_file(workdir / fname)
 
-    print("🌐 Web UI running at http://127.0.0.1:5000")
+    print("🌐 UI at http://127.0.0.1:5000")
     webbrowser.open("http://127.0.0.1:5000")
     app.run(port=5000, debug=False)
 
 
-# ==============================
-# Command-line Entry Point
-# ==============================
+# =====================================================
+#   CLI Entry
+# =====================================================
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Convert Apigee proxy bundles to OpenAPI 3.0 spec.")
-    parser.add_argument("input", nargs="?", help="Path to Apigee bundle (zip or folder).")
-    parser.add_argument("--preview", action="store_true", help="Preview Swagger UI after conversion.")
-    parser.add_argument("--ui", action="store_true", help="Launch simple web UI.")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(description="Convert Apigee proxy bundles to OpenAPI 3.0")
+    p.add_argument("input", nargs="?", help="ZIP or folder path")
+    p.add_argument("--preview", action="store_true", help="Launch Swagger UI after conversion")
+    p.add_argument("--ui", action="store_true", help="Launch simple upload UI")
+    p.add_argument("--endpoint", default="", help="Base proxy endpoint URL")
+    args = p.parse_args()
 
     if args.ui:
         launch_ui()
     elif args.input:
-        converter = ApigeeToOpenAPI(args.input)
-        base_path = converter.extract_zip()
-        _ = converter.find_proxy_files(base_path)
-        openapi_data = converter.convert_to_openapi()
-        _, yaml_path = converter.save_to_file(openapi_data)
+        conv = ApigeeToOpenAPI(args.input)
+        spec = conv.generate(endpoint_url=args.endpoint)
+        _, y = conv.save()
         if args.preview:
-            preview_swagger_ui(yaml_path)
+            swagger_preview(y)
     else:
-        parser.print_help()
+        p.print_help()
