@@ -106,15 +106,16 @@ def launch_ui():
     upload_dir = Path(tempfile.mkdtemp())
 
     TEMPLATE = """
+    {% raw %}
     <!DOCTYPE html>
     <html lang="en">
     <head>
         <meta charset="UTF-8">
         <title>Apigee → OpenAPI Converter</title>
         <style>
-            body {{ font-family: sans-serif; margin: 40px; }}
-            h2 {{ color: #333; }}
-            .box {{ border: 2px dashed #bbb; padding: 20px; border-radius: 12px; width: 400px; }}
+            body { font-family: sans-serif; margin: 40px; }
+            h2 { color: #333; }
+            .box { border: 2px dashed #bbb; padding: 20px; border-radius: 12px; width: 400px; }
         </style>
     </head>
     <body>
@@ -123,13 +124,17 @@ def launch_ui():
             <input type="file" name="file" accept=".zip" required><br><br>
             <button type="submit">Convert</button>
         </form>
+        {% endraw %}
         {% if swagger_url %}
             <p>✅ Conversion complete!</p>
             <a href="{{ swagger_url }}" target="_blank">Open Swagger UI Preview</a>
         {% endif %}
+    {% raw %}
     </body>
     </html>
+    {% endraw %}
     """
+
 
     @app.route("/", methods=["GET"])
     def index():
