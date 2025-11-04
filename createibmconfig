@@ -1,0 +1,376 @@
+#!/usr/bin/env python3
+"""
+map_apigee_to_ibm_full.py
+
+Reads a JSON file exported from Apigee (apigee_policies_full.json) and maps Apigee
+policies to IBM API Connect 'assembly' (execute) policy blocks.
+
+Outputs:
+  - ibm_api_connect_assembly.json
+  - ibm_api_connect_assembly.yaml  (if PyYAML is installed)
+
+Usage:
+  python map_apigee_to_ibm_full.py \
+      --input apigee_policies_full.json \
+      --output-json ibm_api_connect_assembly.json \
+      --output-yaml ibm_api_connect_assembly.yaml
+
+The mapping is conservative: known Apigee types are translated to reasonable IBM equivalents.
+Unknown types are preserved with raw XML and a "migration_note".
+"""
+
+import json
+import argparse
+import os
+import sys
+from copy import deepcopy
+
+# Try importing PyYAML for YAML output; if not available, we proceed with JSON only.
+try:
+    import yaml  # PyYAML
+    HAVE_YAML = True
+except Exception:
+    HAVE_YAML = False
+
+# ----------------------------
+# Config / Defaults
+# ----------------------------
+DEFAULT_INPUT = "apigee_policies_full.json"
+DEFAULT_OUTPUT_JSON = "ibm_api_connect_assembly.json"
+DEFAULT_OUTPUT_YAML = "ibm_api_connect_assembly.yaml"
+
+# ----------------------------
+# Helper utilities
+# ----------------------------
+
+def safe_get_attr(policy, key, default=None):
+    """Helper to safely get attribute values from policy['attributes']"""
+    attrs = policy.get("attributes") or {}
+    return attrs.get(key, default)
+
+def normalize_rate(rate_str):
+    """
+    Convert Apigee rate notation (e.g., '10ps' or '100/s') into IBM expected format.
+    IBM rate-limit usually expects a numeric value and time unit; we'll return a dict.
+    """
+    if not rate_str:
+        return None
+    s = rate_str.strip().lower()
+    # common Apigee formats: "10ps" (per second), "10pm" (per minute), "100/s", "60/m"
+    if s.endswith("ps") or s.endswith("/s") or s.endswith("persecond") or s.endswith("per_second"):
+        try:
+            val = int(''.join([c for c in s if c.isdigit()]))
+            return {"value": val, "unit": "second"}
+        except:
+            pass
+    if s.endswith("pm") or s.endswith("/m") or s.endswith("perminute") or s.endswith("per_minute"):
+        try:
+            val = int(''.join([c for c in s if c.isdigit()]))
+            return {"value": val, "unit": "minute"}
+        except:
+            pass
+    # fallback: return raw
+    return {"raw": rate_str}
+
+def make_note(msg):
+    return {"migration_note": msg}
+
+# ----------------------------
+# Mapping functions per policy type
+# ----------------------------
+
+def map_VerifyAPIKey(policy):
+    """Map Apigee VerifyAPIKey to IBM API Connect -- client-id validation block (approx)."""
+    # IBM has policies like validateapikey or oauth, but in assembly we can include 'validate-keys' style
+    header = safe_get_attr(policy, "VerifyAPIKey.APIKey") or safe_get_attr(policy, "APIKey") or "request.header.apikey"
+    title = policy.get("displayName") or policy.get("name")
+    return {
+        "validate-api-key": {
+            "title": title,
+            "in": header,                # conceptual: where key expected
+            "failAction": "raise"       # keep behaviour obvious for later tuning
+        }
+    }
+
+def map_OAuthV2(policy):
+    """Map Apigee OAuthV2 to IBM oauth / validate token style."""
+    title = policy.get("displayName") or policy.get("name")
+    # Apigee OAuthV2 can do operations like VerifyAccessToken or GenerateAccessToken.
+    # For verification mapping to IBM: validate-jwt / oauth2
+    grant_type = safe_get_attr(policy, "GrantType") or safe_get_attr(policy, "OAuthV2.GrantType")
+    return {
+        "oauth-validate": {
+            "title": title,
+            "grantType": grant_type or "any",
+            "settings": {
+                "tokenStore": safe_get_attr(policy, "TokenStore") or None
+            }
+        }
+    }
+
+def map_VerifyJWT(policy):
+    title = policy.get("displayName") or policy.get("name")
+    return {
+        "validate-jwt": {
+            "title": title,
+            "issuer": safe_get_attr(policy, "Issuer") or None,
+            "audience": safe_get_attr(policy, "Audience") or None,
+            "jwksUri": safe_get_attr(policy, "JWKSUri") or None
+        }
+    }
+
+def map_GenerateJWT(policy):
+    title = policy.get("displayName") or policy.get("name")
+    return {
+        "generate-jwt": {
+            "title": title,
+            "algorithm": safe_get_attr(policy, "Algorithm") or "RS256",
+            "claims": safe_get_attr(policy, "Claims") or {}
+        }
+    }
+
+def map_SpikeArrest(policy):
+    title = policy.get("displayName") or policy.get("name")
+    rate = safe_get_attr(policy, "SpikeArrest.rate") or safe_get_attr(policy, "rate") or safe_get_attr(policy, "SpikeArrest.Rate") or safe_get_attr(policy, "Rate")
+    rl = normalize_rate(rate)
+    return {"rate-limit": {"title": title, "rate": rl or {"raw": rate}}}
+
+def map_Quota(policy):
+    title = policy.get("displayName") or policy.get("name")
+    interval = safe_get_attr(policy, "Interval") or safe_get_attr(policy, "Quota.Interval")
+    limit = safe_get_attr(policy, "Allow") or safe_get_attr(policy, "Quota.Allowed") or safe_get_attr(policy, "AllowCount")
+    return {"quota": {"title": title, "limit": int(limit) if limit and str(limit).isdigit() else limit, "interval": interval}}
+
+def map_ConcurrentRateLimit(policy):
+    title = policy.get("displayName") or policy.get("name")
+    concurrency = safe_get_attr(policy, "ConcurrentRateLimit.Concurrency") or safe_get_attr(policy, "Concurrency")
+    return {"concurrent-rate-limit": {"title": title, "concurrency": int(concurrency) if concurrency and str(concurrency).isdigit() else concurrency}}
+
+def map_AssignMessage(policy):
+    title = policy.get("displayName") or policy.get("name")
+    # AssignMessage maps to set-variable or policy that sets headers/body
+    actions = []
+    for k, v in (policy.get("attributes") or {}).items():
+        # heuristics: attributes contain element tags, many will be 'Set' or 'AssignTo'
+        if "AssignMessage" in k or "AssignTo" in k or k.lower().startswith("set"):
+            actions.append({"set": k, "value": v})
+    # fallback: if xml contained full instructions, pass through
+    if not actions:
+        actions = [{"passthrough_xml": policy.get("xmlSource")}]
+    return {"set-variable": {"title": title, "actions": actions}}
+
+def map_ExtractVariables(policy):
+    title = policy.get("displayName") or policy.get("name")
+    # ExtractVariables tends to define variables with xpath/jsonpath. We'll carry over patterns.
+    extract_rules = []
+    for k, v in (policy.get("attributes") or {}).items():
+        if "xpath" in k.lower() or "jsonpath" in k.lower() or "variable" in k.lower():
+            extract_rules.append({k: v})
+    if not extract_rules:
+        extract_rules = [{"raw": policy.get("xmlSource")}]
+    return {"extract-variables": {"title": title, "rules": extract_rules}}
+
+def map_RaiseFault(policy):
+    title = policy.get("displayName") or policy.get("name")
+    code = safe_get_attr(policy, "Fault. FaultResponse.StatusCode") or safe_get_attr(policy, "Fault.StatusCode") or safe_get_attr(policy, "StatusCode")
+    reason = safe_get_attr(policy, "Fault.Reason") or safe_get_attr(policy, "Reason")
+    return {"raise-fault": {"title": title, "status": code or "400", "reason": reason or "Raised by migration mapping"}}
+
+def map_ServiceCallout(policy):
+    title = policy.get("displayName") or policy.get("name")
+    # Map to 'invoke' with endpoint URL if present
+    target = safe_get_attr(policy, "RequestURL") or safe_get_attr(policy, "ServiceCallout.TargetEndpoint") or safe_get_attr(policy, "Target")
+    if not target:
+        # Possibly the target is embedded elsewhere in XML. Attach raw xml.
+        return {"invoke": {"title": title, "settings": {"note": "ServiceCallout needs manual target verification", "raw": policy.get("xmlSource")}}}
+    return {"invoke": {"title": title, "target-url": target}}
+
+def map_MessageLogging(policy):
+    title = policy.get("displayName") or policy.get("name")
+    # IBM assembly has logging policies; map to 'log' with level/destination
+    destination = safe_get_attr(policy, "MessageLogging.LogEndpoint") or safe_get_attr(policy, "LogEndpoint")
+    if not destination:
+        destination = "default-log"
+    return {"log": {"title": title, "destination": destination, "message": safe_get_attr(policy, "Message") or "Logged by migration mapping"}}
+
+def map_ResponseCache(policy):
+    title = policy.get("displayName") or policy.get("name")
+    cache_name = safe_get_attr(policy, "CacheResource") or safe_get_attr(policy, "ResponseCache.CacheResource") or "default-cache"
+    timeout = safe_get_attr(policy, "ExpirySettings.TimeoutInSec") or safe_get_attr(policy, "TimeoutInSec")
+    return {"cache-response": {"title": title, "cache": cache_name, "timeout": int(timeout) if timeout and str(timeout).isdigit() else timeout}}
+
+def map_PopulateCache(policy):
+    title = policy.get("displayName") or policy.get("name")
+    cache_name = safe_get_attr(policy, "CacheResource") or "default-cache"
+    return {"cache-populate": {"title": title, "cache": cache_name}}
+
+def map_InvalidateCache(policy):
+    title = policy.get("displayName") or policy.get("name")
+    cache_name = safe_get_attr(policy, "CacheResource") or "default-cache"
+    keys = safe_get_attr(policy, "Keys") or safe_get_attr(policy, "InvalidateCache.Keys")
+    return {"cache-invalidate": {"title": title, "cache": cache_name, "keys": keys}}
+
+def map_XMLToJSON(policy):
+    title = policy.get("displayName") or policy.get("name")
+    return {"transform": {"title": title, "type": "xml-to-json"}}
+
+def map_JSONToXML(policy):
+    title = policy.get("displayName") or policy.get("name")
+    return {"transform": {"title": title, "type": "json-to-xml"}}
+
+def map_JavaCallout(policy):
+    title = policy.get("displayName") or policy.get("name")
+    classname = safe_get_attr(policy, "Class")
+    return {"java-callout": {"title": title, "class": classname, "note": "Ensure Java class is deployed on the runtime."}}
+
+def map_Javascript(policy):
+    title = policy.get("displayName") or policy.get("name")
+    # IBM supports JavaScript execution in assembly in some forms; carry script body
+    script = safe_get_attr(policy, "Script") or safe_get_attr(policy, "Source") or policy.get("xmlSource")
+    return {"javascript": {"title": title, "script": script}}
+
+def map_PythonScript(policy):
+    title = policy.get("displayName") or policy.get("name")
+    script = safe_get_attr(policy, "Script") or policy.get("Source") or policy.get("xmlSource")
+    return {"python": {"title": title, "script": script}}
+
+def map_StatisticsCollector(policy):
+    title = policy.get("displayName") or policy.get("name")
+    metrics = safe_get_attr(policy, "Metrics") or {}
+    return {"collect-metrics": {"title": title, "metrics": metrics}}
+
+def map_Default(policy):
+    """Fallback mapping for unknown or custom policies."""
+    return {
+        "custom": {
+            "title": policy.get("displayName") or policy.get("name"),
+            "note": "No direct IBM equivalent found; raw XML preserved for manual migration.",
+            "raw_xml": policy.get("xmlSource")
+        }
+    }
+
+# ----------------------------
+# Central dispatcher
+# ----------------------------
+
+POLICY_DISPATCH = {
+    "VerifyAPIKey": map_VerifyAPIKey,
+    "OAuthV2": map_OAuthV2,
+    "VerifyJWT": map_VerifyJWT,
+    "GenerateJWT": map_GenerateJWT,
+    "SpikeArrest": map_SpikeArrest,
+    "Quota": map_Quota,
+    "ConcurrentRateLimit": map_ConcurrentRateLimit,
+    "AssignMessage": map_AssignMessage,
+    "ExtractVariables": map_ExtractVariables,
+    "RaiseFault": map_RaiseFault,
+    "ServiceCallout": map_ServiceCallout,
+    "MessageLogging": map_MessageLogging,
+    "ResponseCache": map_ResponseCache,
+    "PopulateCache": map_PopulateCache,
+    "InvalidateCache": map_InvalidateCache,
+    "XMLToJSON": map_XMLToJSON,
+    "JSONToXML": map_JSONToXML,
+    "JavaCallout": map_JavaCallout,
+    "Javascript": map_Javascript,
+    "PythonScript": map_PythonScript,
+    "StatisticsCollector": map_StatisticsCollector,
+    # Add more explicit mappings here...
+}
+
+def map_policy(policy):
+    """Map a single policy dict to IBM assembly block using dispatch table."""
+    ptype = policy.get("type", "")
+    # Apigee root tag might have namespace; strip namespace if present
+    if "}" in ptype:
+        ptype = ptype.split("}", 1)[1]
+    mapper = POLICY_DISPATCH.get(ptype)
+    if mapper:
+        try:
+            return mapper(policy)
+        except Exception as e:
+            return {"custom": {"title": policy.get("name"), "error": str(e), "raw_xml": policy.get("xmlSource")}}
+    else:
+        # try heuristics: some policies may be named differently; match by name contains
+        for key in POLICY_DISPATCH.keys():
+            if key.lower() in ptype.lower() or key.lower() in (policy.get("name") or "").lower():
+                try:
+                    return POLICY_DISPATCH[key](policy)
+                except:
+                    break
+        # fallback
+        return map_Default(policy)
+
+# ----------------------------
+# Main script
+# ----------------------------
+
+def build_assembly_from_apigee(input_json_path):
+    with open(input_json_path, "r", encoding="utf-8") as f:
+        apigee = json.load(f)
+
+    api_name = apigee.get("api_name") or os.path.basename(input_json_path).replace(".json", "")
+    policies = apigee.get("policies", [])
+
+    assembly_execute = []
+    unmapped = []
+
+    for policy in policies:
+        mapped = map_policy(policy)
+        # We want the assembly execute array to contain single-key policy objects; ensure shape:
+        assembly_execute.append(mapped)
+        # track which got defaulted
+        if "custom" in mapped and mapped["custom"].get("raw_xml"):
+            unmapped.append(policy.get("name"))
+
+    ibm_assembly = {
+        "api_name": api_name,
+        "assembly": {
+            "execute": assembly_execute
+        },
+        "metadata": {
+            "policy_count": len(policies),
+            "unmapped_policies": unmapped
+        }
+    }
+    return ibm_assembly
+
+def write_outputs(assembly_obj, json_path, yaml_path=None):
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(assembly_obj, f, indent=2)
+    print(f"Written JSON assembly to: {json_path}")
+
+    if yaml_path:
+        if not HAVE_YAML:
+            print("PyYAML not installed; skipping YAML output. Install pyyaml to enable YAML export.")
+        else:
+            with open(yaml_path, "w", encoding="utf-8") as f:
+                yaml.safe_dump(assembly_obj, f, sort_keys=False)
+            print(f"Written YAML assembly to: {yaml_path}")
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Map Apigee policies JSON to IBM API Connect assembly JSON/YAML.")
+    p.add_argument("--input", "-i", default=DEFAULT_INPUT, help="Input Apigee policies JSON (from step 1)")
+    p.add_argument("--output-json", "-j", default=DEFAULT_OUTPUT_JSON, help="Output IBM assembly JSON path")
+    p.add_argument("--output-yaml", "-y", default=None, help="Optional YAML output path (requires PyYAML)")
+    return p.parse_args()
+
+def main():
+    args = parse_args()
+    if not os.path.exists(args.input):
+        print(f"Input file not found: {args.input}", file=sys.stderr)
+        sys.exit(2)
+
+    assembly = build_assembly_from_apigee(args.input)
+
+    write_outputs(assembly, args.output_json, args.output_yaml)
+
+    print("Mapping complete.")
+    print(f"Policies mapped: {assembly['metadata']['policy_count']}")
+    if assembly['metadata']['unmapped_policies']:
+        print("Unmapped policies (need manual review):")
+        for name in assembly['metadata']['unmapped_policies']:
+            print("  -", name)
+
+if __name__ == "__main__":
+    main()
