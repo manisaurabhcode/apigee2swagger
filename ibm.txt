@@ -1,0 +1,6 @@
+    - json-threat-protection:
+        max-depth: 10
+        max-entry-name-length: 50
+        max-string-value-length: 500
+        max-entry-count: 15
+        max-array-size: 20
